@@ -1,0 +1,905 @@
+#!/usr/bin/env python3
+"""watch-workflow: each subagent of a Claude Code workflow, live, in its own Ghostty split.
+
+    watch-workflow                the newest run, in any project
+    watch-workflow wf_d557        a run by its id, or a prefix of it, or its directory
+    watch-workflow --list         the recent runs
+    watch-workflow --cols 3       columns per phase's tab (default: one per 100 characters)
+    watch-workflow --lines 5      lines of each tool result a pane shows (default 3, 0 for all)
+    watch-workflow --no-links     no links on the [+N lines] counts (see below)
+    watch-workflow --dry-run      print each osascript call instead of making it; still follows the run
+    watch-workflow --self-test    check the parsing, layout and formatting offline
+
+Run it in a Ghostty terminal: it drives Ghostty's AppleScript API (1.3 and
+later). That terminal becomes the run's status board. Each phase of the
+workflow gets a tab of its own, named for the phase, and each agent a split in
+it, added as the agent starts: a row filled --cols wide, then the next. A
+pane keeps a bar on its top line (the agent, its phase and state, its tool
+calls and time) and below it follows the agent's transcript: its text, each
+tool call, and the first --lines lines of each result, with a count of the rest,
+all fitted to the pane's width. A result's blank lines aren't shown or counted.
+When the agent's result reaches the journal the bar says done, and the pane
+stays open. Ctrl-C stops the board; the panes are ordinary Ghostty splits.
+
+A cut result's [+N lines] is a link: Cmd-click it, and the whole result opens in
+the browser. Nothing is written for it. The board serves each result from the
+agent's transcript when its link is clicked, on 127.0.0.1 at a port of its own,
+behind a random token, and only while it runs: once Ctrl-C stops it, the links
+stop working. Each pane learns the address from its environment, set by the
+AppleScript, never from its command line.
+
+What it reads, all of it local and none of it changed:
+~/.claude/projects/<project>/<session>/subagents/workflows/wf_<id>/
+    journal.jsonl        a "started" line per agent (its id, label and phase),
+                         then a "result" line with what it returned
+    agent-<id>.jsonl     that agent's transcript, written as it works
+and the workflow's name, from <session>/workflows/scripts/<name>-wf_<id>.js.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime
+import hmac
+import http.server
+import io
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+import urllib.request
+from pathlib import Path
+
+CONFIG = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+POLL = 0.5
+COLUMN = 100     # characters of window width per grid column
+TEXT_LINES = 6   # of an agent's text, per message
+CALL_LINES = 3   # of a tool call's description or command
+RESULT_LINES = 3 # of a tool result, by default: --lines
+STAMP = 10       # "HH:MM:SS  " before each line
+MARKED = STAMP + 4  # and "  ✓ " before a result's lines
+LINKS = "WATCH_WORKFLOW_LINKS"  # a pane's environment: the board's link server
+SAFE = re.compile(r"[A-Za-z0-9_-]+")  # an agent's or a tool call's id, a token
+
+DIM, BOLD, GREEN, RED, CYAN, YELLOW, INVERT, RESET = (
+    "\033[2m", "\033[1m", "\033[32m", "\033[31m", "\033[36m", "\033[33m", "\033[7m", "\033[0m")
+
+
+def width():
+    """The pane's width now: splits added beside it narrow it as the run goes."""
+    return max(40, shutil.get_terminal_size((120, 40)).columns - 1)
+
+
+# --- finding a run ---------------------------------------------------------
+
+def runs(root=None):
+    """Every workflow run, newest first by its journal's last write."""
+    root = Path(root or CONFIG / "projects")
+    found = [p.parent for p in root.glob("*/*/subagents/workflows/wf_*/journal.jsonl")]
+    return sorted(found, key=lambda d: (d / "journal.jsonl").stat().st_mtime, reverse=True)
+
+
+def find_run(arg, root=None):
+    if not arg:
+        got = runs(root)
+        if not got:
+            raise SystemExit(f"no workflow runs under {root or CONFIG / 'projects'}")
+        return got[0]
+    path = Path(arg).expanduser()
+    if (path / "journal.jsonl").is_file():
+        return path
+    hits = [d for d in runs(root) if d.name.startswith(arg) or d.name.startswith(f"wf_{arg}")]
+    if not hits:
+        raise SystemExit(f"no workflow run matches {arg!r}; try --list")
+    if len({d.name for d in hits}) > 1:
+        raise SystemExit(f"{arg!r} matches several runs: {', '.join(d.name for d in hits)}")
+    return hits[0]
+
+
+def run_name(run):
+    """The workflow's meta.name, from the script the run saved beside the session."""
+    scripts = run.parents[2] / "workflows" / "scripts"
+    for p in scripts.glob(f"*-{run.name}.js") if scripts.is_dir() else []:
+        return p.name[: -len(f"-{run.name}.js")]
+    return "workflow"
+
+
+# --- reading as it grows -----------------------------------------------------
+
+class Follow:
+    """A JSONL file read as it grows: whole lines only, and nothing twice."""
+
+    def __init__(self, path):
+        self.path, self.offset, self.partial = Path(path), 0, b""
+
+    def new(self):
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self.offset)
+                chunk = f.read()
+        except FileNotFoundError:
+            return []
+        self.offset += len(chunk)
+        lines = (self.partial + chunk).split(b"\n")
+        self.partial = lines.pop()
+        out = []
+        for line in lines:
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                continue
+        return out
+
+
+class Journal:
+    def __init__(self, path):
+        self.follow, self.agents, self.results = Follow(path), [], {}
+
+    def update(self):
+        """The agents started since the last call."""
+        fresh = []
+        for e in self.follow.new():
+            if e.get("type") == "started" and e.get("agentId"):
+                a = {"id": e["agentId"], "label": e.get("label") or e["agentId"],
+                     "phase": e.get("phase") or "agents"}
+                self.agents.append(a)
+                fresh.append(a)
+            elif e.get("type") == "result" and e.get("agentId"):
+                self.results[e["agentId"]] = e.get("result")
+        return fresh
+
+
+# --- what an agent did, as lines ---------------------------------------------
+
+def clock(ts):
+    try:
+        t = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return t.astimezone().strftime("%H:%M:%S")
+    except (AttributeError, ValueError):
+        return "--:--:--"
+
+
+def flat(text):
+    return " ".join(str(text).split())
+
+
+def one_line(text, room):
+    text = flat(text)
+    return text if len(text) <= room else text[: max(1, room - 1)] + "…"
+
+
+def tool_summary(name, args):
+    """A tool call in words: its description where it has one, else what it's on."""
+    args = args if isinstance(args, dict) else {}
+    for key in ("description", "file_path", "pattern", "url", "query", "path", "command",
+                "prompt"):
+        if args.get(key):
+            return f"{name}: {flat(args[key])}"
+    if name == "StructuredOutput":
+        return "StructuredOutput: returning its result"
+    return name
+
+
+def result_text(content):
+    if isinstance(content, list):
+        content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+    return str(content or "").strip()
+
+
+def wrapped(text, room, most):
+    """text wrapped to room, at most `most` lines, the last cut with … if more."""
+    lines = textwrap.wrap(flat(text), max(10, room)) or [""]
+    if len(lines) > most:
+        lines = lines[:most]
+        lines[-1] = one_line(lines[-1] + " …", room)
+    return lines
+
+
+def hyperlink(text, url):
+    """text as an OSC 8 link, which Ghostty opens on Cmd-click. It takes no
+    columns of its own."""
+    return f"\033]8;;{url}\033\\{text}\033]8;;\033\\" if url else text
+
+
+def result_lines(content, at, error, cols, most, url=None):
+    """A tool result's first `most` lines (every line for 0), each fitted to
+    cols, the last carrying how many more there are, linked to url when it's
+    given. A line that ends short is the line's end, not a cut."""
+    got = [ln for ln in result_text(content).splitlines() if ln.strip()] or ["(no output)"]
+    shown = got if most <= 0 else got[:most]
+    rest = len(got) - len(shown)
+    mark = f"{RED}✗" if error else f"{GREEN}✓"
+    lines = []
+    for i, line in enumerate(shown):
+        count = f"[+{rest} line{'' if rest == 1 else 's'}]" if rest and i == len(shown) - 1 else ""
+        text = one_line(line, cols - MARKED - (len(count) + 2 if count else 0))
+        more = f"  {hyperlink(count, url)}" if count else ""
+        head = f"{DIM}{at}{RESET}    {mark} {RESET}" if i == 0 else " " * MARKED
+        lines.append(f"{head}{DIM}{text}{more}{RESET}")
+    return lines
+
+
+def render(entry, cols=120, most=RESULT_LINES, link=None):
+    """An entry of an agent's transcript as lines to print, fitted to cols,
+    with at most `most` lines of each tool result (every line for 0). link,
+    given a tool call's id, returns the URL its whole result is served at."""
+    kind, at = entry.get("type"), clock(entry.get("timestamp"))
+    content = (entry.get("message") or {}).get("content")
+    pad, lines = " " * STAMP, []
+    if kind == "assistant" and isinstance(content, list):
+        for c in content:
+            if c.get("type") == "text" and c.get("text", "").strip():
+                text = textwrap.wrap(flat(c["text"]), max(10, cols - STAMP))
+                more = len(text) - TEXT_LINES
+                lines += [f"{DIM}{at}{RESET}  {t}" if i == 0 else f"{pad}{t}"
+                          for i, t in enumerate(text[:TEXT_LINES])]
+                if more > 0:
+                    lines.append(f"{pad}{DIM}[{more} more lines]{RESET}")
+            elif c.get("type") == "tool_use":
+                call = wrapped(tool_summary(c.get("name", "?"), c.get("input")),
+                               cols - STAMP - 2, CALL_LINES)
+                lines += [f"{DIM}{at}{RESET}  {CYAN}▸ {call[0]}{RESET}",
+                          *(f"{pad}  {CYAN}{t}{RESET}" for t in call[1:])]
+    elif kind == "user" and isinstance(content, list):
+        for c in content:
+            if c.get("type") == "tool_result":
+                url = link(c.get("tool_use_id")) if link and c.get("tool_use_id") else None
+                lines += result_lines(c.get("content"), at, c.get("is_error"), cols, most, url)
+    return lines
+
+
+def tool_calls(entry):
+    content = (entry.get("message") or {}).get("content") or []
+    return [c for c in content if isinstance(c, dict) and c.get("type") == "tool_use"]
+
+
+def returned(result):
+    """What an agent returned, in a line."""
+    if isinstance(result, dict):
+        for key, word in (("findings", "findings"), ("verdicts", "verdicts")):
+            if isinstance(result.get(key), list):
+                items = result[key]
+                refuted = sum(1 for v in items if isinstance(v, dict) and v.get("refuted"))
+                return f"{len(items)} {word}" + (f", {refuted} refuted" if key == "verdicts" else "")
+        return "an object: " + ", ".join(sorted(result))
+    if result is None:
+        return "nothing (skipped, or it failed)"
+    return flat(result)
+
+
+def elapsed(seconds):
+    h, rest = divmod(int(max(0, seconds)), 3600)
+    m, s = divmod(rest, 60)
+    return f"{h}h{m:02d}m" if h else f"{m}m{s:02d}s" if m else f"{s}s"
+
+
+def epoch(ts):
+    try:
+        return datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except (AttributeError, ValueError):
+        return None
+
+
+# --- the board's link server --------------------------------------------------
+
+def whole_result(transcript, tool_use_id):
+    """(the call in words, its result in full) from an agent's transcript, or
+    None: read when a link is clicked, so nothing is copied ahead of it."""
+    call, result = None, None
+    for entry in Follow(transcript).new():
+        for c in (entry.get("message") or {}).get("content") or []:
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") == "tool_use" and c.get("id") == tool_use_id:
+                call = tool_summary(c.get("name", "?"), c.get("input"))
+            elif c.get("type") == "tool_result" and c.get("tool_use_id") == tool_use_id:
+                body = c.get("content")
+                if isinstance(body, list):
+                    body = "\n".join(b.get("text", "") for b in body if isinstance(b, dict))
+                result = ("error: " if c.get("is_error") else "") + str(body or "(no output)")
+    return None if result is None else (call or "a tool call", result)
+
+
+class Links:
+    """Serves each result in full at <base>/<agent id>/<tool call id>, read from
+    the agent's transcript in the run, as plain text. Only on 127.0.0.1, only
+    behind the token, and only to a request addressed to 127.0.0.1 itself, so a
+    page that rebinds its own name to this address can't read one."""
+
+    def __init__(self, run):
+        self.run, self.token = Path(run), secrets.token_urlsafe(24)
+        links = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                status, body = links.answer(self.path, self.headers.get("Host", ""))
+                data = body.encode("utf-8", "replace")
+                self.send_response(status)
+                for k, v in (("Content-Type", "text/plain; charset=utf-8"),
+                             ("Content-Length", str(len(data))), ("Cache-Control", "no-store"),
+                             ("X-Content-Type-Options", "nosniff"),
+                             ("Content-Security-Policy", "default-src 'none'")):
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):  # the board's screen is the board's
+                pass
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.httpd.server_address[1]
+        self.base = f"http://127.0.0.1:{self.port}/{self.token}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def answer(self, path, host):
+        if host != f"127.0.0.1:{self.port}":
+            return 403, "Only for this Mac's own address.\n"
+        parts = path.split("?", 1)[0].strip("/").split("/")
+        if (len(parts) != 3 or not hmac.compare_digest(parts[0], self.token)
+                or not all(SAFE.fullmatch(p) for p in parts[1:])):
+            return 404, "No such result.\n"
+        transcript = self.run / f"agent-{parts[1]}.jsonl"
+        got = whole_result(transcript, parts[2]) if transcript.is_file() else None
+        if got is None:
+            return 404, "No such result.\n"
+        call, result = got
+        return 200, f"{call}\n\n{result}\n"
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def pane_links(base, agent):
+    """A pane's link maker, from the base its environment gave it."""
+    if not base or not SAFE.fullmatch(agent):
+        return None
+    return lambda tool_use_id: (f"{base}/{agent}/{tool_use_id}"
+                                if SAFE.fullmatch(str(tool_use_id)) else None)
+
+
+# --- one pane --------------------------------------------------------------
+
+class Pane:
+    """The pane's top line is a bar that stays: the rest scrolls under it. Only
+    on a terminal; to a file or a test it's plain lines."""
+
+    def __init__(self, label, phase, out=None):
+        self.label, self.phase, self.out = label, phase, out or sys.stdout
+        self.tty = self.out.isatty()
+        self.size, self.tools, self.state, self.rows = None, 0, "running", 0
+        self.began = time.time()  # until the transcript says when the agent began
+
+    def write(self, text):
+        self.out.write(text)
+        self.out.flush()
+
+    def fit(self):
+        """The width to print to. On the first call and on every resize, which
+        resets a terminal's scroll region, it sets the region under the bar and
+        puts the cursor after the last line printed, so the text fills down
+        from the bar rather than up from the pane's foot."""
+        size = shutil.get_terminal_size((120, 40))
+        if self.tty and size != self.size:
+            self.size = size
+            self.write(f"\033[2;{size.lines}r\033[{min(2 + self.rows, size.lines)};1H")
+            self.bar()
+        return max(40, size.columns - 1)
+
+    def bar(self):
+        cols = max(40, shutil.get_terminal_size((120, 40)).columns)
+        state = f"{'✔ ' if self.state != 'running' else ''}{self.state}"
+        text = (f" {self.label} · {self.phase} · {state} · {self.tools} tool calls · "
+                f"{elapsed(time.time() - self.began)}")
+        if self.tty:
+            self.write(f"\0337\033[1;1H\033[2K{INVERT}{one_line(text, cols).ljust(cols)}"
+                       f"{RESET}\0338")
+        elif self.state != "running":
+            self.write(f"{text}\n")
+
+    def show(self, lines):
+        for line in lines:  # each fitted to the width, so a line is one row
+            self.write(f"{line}\n")
+            self.rows += 1
+
+
+def tail(transcript, journal, label, phase="agents", once=False, out=None, most=RESULT_LINES):
+    """Follows one agent until its result is in the journal."""
+    pane = Pane(label, phase, out)
+    pane.write(f"\033]2;{label}\007")  # the pane's own title, for when it's focused
+    agent = Path(transcript).stem.removeprefix("agent-")
+    link = pane_links(os.environ.get(LINKS, ""), agent)
+    follow, done = Follow(transcript), Journal(journal)
+    last_bar, dated = 0.0, False
+    while True:
+        cols = pane.fit()
+        for entry in follow.new():
+            if not dated and epoch(entry.get("timestamp")):
+                pane.began, dated = epoch(entry["timestamp"]), True  # the agent's age, not the pane's
+            pane.tools += len(tool_calls(entry))
+            pane.show(render(entry, cols, most, link))
+        done.update()
+        if agent in done.results:
+            pane.state = f"done, returned {returned(done.results[agent])}"
+            pane.bar()
+            pane.show(["", f"{GREEN}{BOLD}✔ done{RESET}  returned "
+                           f"{returned(done.results[agent])}"])
+            return 0
+        if time.monotonic() - last_bar >= 1:
+            pane.bar()
+            last_bar = time.monotonic()
+        if once:
+            return 0
+        time.sleep(POLL)
+
+
+# --- Ghostty ---------------------------------------------------------------
+
+# %ENV% is the pane's environment, written into the script rather than passed
+# as an argument, so the link server's token is never on a command line.
+NEW_TAB = """
+on run argv
+  tell application "Ghostty"
+    set t to new tab in front window with configuration ¬
+      {command:(item 1 of argv), wait after command:true%ENV%}
+    set first_pane to focused terminal of t
+    perform action ("set_tab_title:" & (item 2 of argv)) on first_pane
+    return id of first_pane
+  end tell
+end run
+"""
+
+SPLIT = """
+on run argv
+  tell application "Ghostty"
+    set cfg to {command:(item 3 of argv), wait after command:true%ENV%}
+    set target to terminal id (item 1 of argv)
+    if item 2 of argv is "down" then
+      set t to split target direction down with configuration cfg
+    else
+      set t to split target direction right with configuration cfg
+    end if
+    perform action "equalize_splits" on t
+    return id of t
+  end tell
+end run
+"""
+
+
+class Ghostty:
+    def __init__(self, dry_run=False, env=None):
+        self.dry_run, self.calls, self.scripts = dry_run, [], []
+        # Each value is checked to need no quoting in AppleScript: a URL made
+        # of SAFE characters, ':' and '/', or nothing.
+        for k, v in (env or {}).items():
+            if not (SAFE.fullmatch(k) and re.fullmatch(r"[A-Za-z0-9_:/.-]*", v)):
+                raise ValueError(f"not a value the AppleScript can carry: {k}")
+        pairs = ", ".join(f'"{k}={v}"' for k, v in (env or {}).items())
+        self.env = f", environment variables:{{{pairs}}}" if pairs else ""
+
+    def _run(self, script, *args):
+        script = script.replace("%ENV%", self.env)
+        self.calls.append(args)
+        self.scripts.append(script)
+        if self.dry_run:
+            print(f"{DIM}osascript {' '.join(shlex.quote(a) for a in args)}{RESET}")
+            return f"dry-{len(self.calls)}"
+        p = subprocess.run(["osascript", "-", *args], input=script, capture_output=True,
+                           text=True, check=False)
+        if p.returncode:
+            raise RuntimeError(f"Ghostty refused: {p.stderr.strip()}")
+        return p.stdout.strip()
+
+    def new_tab(self, command, title):
+        return self._run(NEW_TAB, command, title)
+
+    def split(self, terminal, direction, command):
+        return self._run(SPLIT, terminal, direction, command)
+
+
+def place(k, cols):
+    """Where the k-th pane of a tab goes: (the pane to split, the direction), or
+    None for the first, which is the tab's own. The first row is split right,
+    cols wide; after that each pane goes under the one above it in its column,
+    so the tab fills as a grid, a row at a time."""
+    if k == 0:
+        return None
+    if k < cols:
+        return k - 1, "right"
+    return k - cols, "down"
+
+
+def pane_command(agent, run, most=RESULT_LINES):
+    return " ".join(shlex.quote(str(a)) for a in (
+        sys.executable, Path(__file__).resolve(), "--tail", run / f"agent-{agent['id']}.jsonl",
+        "--journal", run / "journal.jsonl", "--label", agent["label"], "--phase", agent["phase"],
+        "--lines", most))
+
+
+# --- the board ---------------------------------------------------------------
+
+class Board:
+    def __init__(self, run, ghostty, cols, most=RESULT_LINES):
+        self.run, self.ghostty, self.cols, self.most = run, ghostty, cols, most
+        self.journal = Journal(run / "journal.jsonl")
+        self.tabs = {}      # phase: the terminal ids of its panes, in order
+        self.seen = {}      # agent id: its Follow, tool count and last action
+        self.name = run_name(run)
+
+    def open(self, agent):
+        panes = self.tabs.setdefault(agent["phase"], [])
+        command = pane_command(agent, self.run, self.most)
+        spot = place(len(panes), self.cols)
+        if spot is None:
+            panes.append(self.ghostty.new_tab(command, agent["phase"]))
+        else:
+            anchor, direction = spot
+            panes.append(self.ghostty.split(panes[anchor], direction, command))
+
+    def step(self):
+        for agent in self.journal.update():
+            self.seen[agent["id"]] = {"follow": Follow(self.run / f"agent-{agent['id']}.jsonl"),
+                                      "tools": 0, "last": "starting"}
+            try:
+                self.open(agent)
+            except RuntimeError as e:
+                self.seen[agent["id"]]["last"] = f"no pane: {e}"
+        for agent in self.journal.agents:
+            s = self.seen[agent["id"]]
+            for entry in s["follow"].new():
+                for c in tool_calls(entry):
+                    s["tools"] += 1
+                    s["last"] = tool_summary(c.get("name", "?"), c.get("input"))
+
+    def draw(self):
+        agents, results, cols = self.journal.agents, self.journal.results, width()
+        out = [f"\033[H\033[2J{BOLD}{self.name}{RESET}  {DIM}{self.run.name}  "
+               f"{datetime.datetime.now():%H:%M:%S}{RESET}",
+               f"{len(results)} of {len(agents)} agents done", ""]
+        for a in agents:
+            s = self.seen[a["id"]]
+            done = a["id"] in results
+            state = f"{GREEN}done{RESET}   " if done else f"{YELLOW}running{RESET}"
+            last = returned(results[a["id"]]) if done else s["last"]
+            out.append(f"{a['phase'][:10]:<10} {a['label'][:24]:<24} {state} "
+                       f"{s['tools']:>4}  {DIM}{one_line(last, cols - 50)}{RESET}")
+        if agents and len(results) == len(agents):
+            out += ["", f"{DIM}All started agents are done. A later phase may still start;"
+                        f" Ctrl-C to stop.{RESET}"]
+        sys.stdout.write("\n".join(out) + "\n")
+        sys.stdout.flush()
+
+
+def watch(run, cols=None, dry_run=False, once=False, most=RESULT_LINES, links=True):
+    if not dry_run and os.environ.get("TERM_PROGRAM") != "ghostty":
+        raise SystemExit("Run this in a Ghostty terminal: it opens Ghostty tabs and splits. "
+                         "--dry-run shows what it would do.")
+    cols = cols or max(1, shutil.get_terminal_size((200, 40)).columns // COLUMN)
+    server = Links(run) if links else None
+    env = {LINKS: server.base} if server else {}
+    board = Board(run, Ghostty(dry_run, env), cols, most)
+    board.server = server
+    sys.stdout.write("\033]2;watch-workflow\007")
+    try:
+        while True:
+            board.step()
+            if not dry_run:
+                board.draw()
+            if once:
+                return board
+            time.sleep(POLL * 2)
+    except KeyboardInterrupt:
+        print()
+        return board
+    finally:
+        if server and not once:
+            server.close()
+
+
+def list_runs(root=None, count=12):
+    for run in runs(root)[:count]:
+        j = Journal(run / "journal.jsonl")
+        j.update()
+        when = datetime.datetime.fromtimestamp((run / "journal.jsonl").stat().st_mtime)
+        print(f"{run.name}  {when:%m-%d %H:%M}  {run_name(run):<32} "
+              f"{len(j.results)}/{len(j.agents)} done  {DIM}{run.parents[2].name[:8]}{RESET}")
+
+
+# --- self-test -----------------------------------------------------------------
+
+def self_test():
+    """The parts that need no Ghostty, against a synthetic run shaped like a real one."""
+    fails = []
+
+    def check(what, got, want):
+        if got != want:
+            fails.append(f"{what}: got {got!r}, want {want!r}")
+
+    check("grid of 5, two columns", [place(k, 2) for k in range(5)],
+          [None, (0, "right"), (0, "down"), (1, "down"), (2, "down")])
+    check("grid of 4, three columns", [place(k, 3) for k in range(4)],
+          [None, (0, "right"), (1, "right"), (0, "down")])
+    check("one column", [place(k, 1) for k in range(3)], [None, (0, "down"), (1, "down")])
+    check("a Bash call", tool_summary("Bash", {"command": "ls", "description": "List them"}),
+          "Bash: List them")
+    check("a Read call", tool_summary("Read", {"file_path": "/a/b.py"}), "Read: /a/b.py")
+    check("verdicts", returned({"verdicts": [{"refuted": True}, {"refuted": False}]}),
+          "2 verdicts, 1 refuted")
+    check("findings", returned({"findings": [{}, {}, {}], "checked_and_fine": []}), "3 findings")
+    check("a skipped agent", returned(None), "nothing (skipped, or it failed)")
+    long_call = {"type": "assistant", "timestamp": "2026-10-13T23:59:51Z", "message": {
+        "content": [{"type": "tool_use", "name": "Bash", "input": {"description": "word " * 80}}]}}
+    for cols in (60, 200):
+        got = render(long_call, cols)
+        plain = [ln.replace(CYAN, "").replace(DIM, "").replace(RESET, "") for ln in got]
+        check(f"a long call at {cols} wide: at most {CALL_LINES} lines", len(got) <= CALL_LINES, True)
+        check(f"and none wider than {cols}", max(len(p) for p in plain) <= cols, True)
+    check("a wide pane shows more of a result than a narrow one",
+          len(render({"type": "user", "message": {"content": [
+              {"type": "tool_result", "content": "x" * 300}]}}, 200)[0])
+          > len(render({"type": "user", "message": {"content": [
+              {"type": "tool_result", "content": "x" * 300}]}}, 80)[0]), True)
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "projects"
+        session = root / "-Users-x-proj" / "1234abcd-0000"
+        run = session / "subagents" / "workflows" / "wf_abc123-def"
+        run.mkdir(parents=True)
+        (session / "workflows" / "scripts").mkdir(parents=True)
+        (session / "workflows" / "scripts" / "my-review-wf_abc123-def.js").write_text("")
+        started = [{"type": "started", "agentId": f"a{n}", "label": f"review:{n}",
+                    "phase": "Review" if n < 3 else "Verify"} for n in range(5)]
+        journal = run / "journal.jsonl"
+        journal.write_text("".join(json.dumps(e) + "\n" for e in [{"type": "launched"}, *started]))
+        (run / "agent-a0.jsonl").write_text("\n".join(json.dumps(e) for e in [
+            {"type": "assistant", "timestamp": "2026-10-13T23:59:51Z", "message": {"content": [
+                {"type": "thinking", "thinking": ""},
+                {"type": "tool_use", "id": "toolu_a", "name": "Bash",
+                 "input": {"command": "git status", "description": "Read status"}}]}},
+            {"type": "user", "timestamp": "2026-10-13T23:59:52Z", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_a", "is_error": True,
+                 "content": "fatal: no repo\nmore"}]}},
+            {"type": "attachment", "attachment": {"type": "total_tokens_reminder"}},
+        ]) + "\n{\"type\": \"assistant\", \"mess")  # a line still being written
+        check("newest run", find_run(None, root), run)
+        check("run by prefix", find_run("abc", root), run)
+        check("run name", run_name(run), "my-review")
+        entries = list(Follow(run / "agent-a0.jsonl").new())
+        lines = [ln for e in entries for ln in render(e, 120, 1)]
+        check("rendered lines, at --lines 1", len(lines), 2)
+        check("tool line", "▸ Bash: Read status" in lines[0], True)
+        check("error line, its first line only, and how many more",
+              "✗" in lines[1] and "fatal: no repo" in lines[1] and "[+1 line]" in lines[1]
+              and "more\x1b" not in lines[1], True)
+        both = [ln for e in entries for ln in render(e)]
+        check("by default, both of its lines and no count", len(both) == 3
+              and "fatal: no repo" in both[1] and both[2].startswith(" " * MARKED)
+              and "more" in both[2] and not any("[+" in ln for ln in both), True)
+        one = render({"type": "user", "message": {"content": [
+            {"type": "tool_result", "content": "just this"}]}}, 120)[0]
+        check("a one-line result says nothing more", "[+" not in one and "just this" in one, True)
+        many = render({"type": "user", "message": {"content": [
+            {"type": "tool_result", "content": "x" * 300 + "\nsecond\nthird"}]}}, 80, 1)[0]
+        plain = many.replace(DIM, "").replace(RESET, "").replace(GREEN, "")
+        check("a long first line still fits with its count", len(plain) <= 80
+              and plain.endswith("[+2 lines]"), True)
+
+        def result(content, cols=120, most=RESULT_LINES):
+            got = render({"type": "user", "timestamp": "2026-10-14T12:00:00Z", "message": {
+                "content": [{"type": "tool_result", "content": content}]}}, cols, most)
+            return [ln.replace(DIM, "").replace(RESET, "").replace(GREEN, "") for ln in got]
+
+        five = result("one\ntwo\nthree\nfour\nfive")
+        check(f"by default, {RESULT_LINES} lines of a result", len(five), RESULT_LINES)
+        check("the count on the last line shown", five[-1].endswith("three  [+2 lines]"), True)
+        check("the lines after the first line up under its text", len(five) > 1
+              and five[1].startswith(" " * MARKED + "two") and five[0].index("one") == MARKED,
+              True)
+        check("0 shows every line, and no count",
+              len(result("one\ntwo\nthree\nfour\nfive", most=0)) == 5
+              and not any("[+" in ln for ln in result("one\ntwo\nthree\nfour\nfive", most=0)),
+              True)
+        check("blank lines are neither shown nor counted",
+              result("one\n\n  \ntwo\n\nthree", most=2), [result("x")[0].replace("x", "one"),
+                                                           " " * MARKED + "two  [+1 line]"])
+        wide = result(("y" * 200 + "\n") * 4, cols=60)
+        check("each line shown fits the pane", max(len(ln) for ln in wide) <= 60, True)
+        check("no output says so", "(no output)" in result("")[0], True)
+        f = Follow(run / "agent-a0.jsonl")
+        f.new()
+        with open(run / "agent-a0.jsonl", "a") as out:
+            out.write("age\": {}}\n")
+        check("a partial line, finished later", [e.get("type") for e in f.new()], ["assistant"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            board = watch(run, cols=2, dry_run=True, once=True)
+        check("one tab per phase, named for it, and splits for the rest",
+              [c[1] if len(c) == 2 else c[1] for c in board.ghostty.calls],
+              ["Review", "right", "down", "Verify", "right"])
+        check("the Review tab's second pane goes right of its first",
+              board.ghostty.calls[1][:2], ("dry-1", "right"))
+        check("its third goes under its first", board.ghostty.calls[2][:2], ("dry-1", "down"))
+        check("the panes know their phase", "--phase Review" in board.ghostty.calls[1][2], True)
+        check("and how many lines of a result to show",
+              board.ghostty.calls[1][2].endswith(f"--lines {RESULT_LINES}"), True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            five_board = watch(run, cols=2, dry_run=True, once=True, most=5)
+        # a new tab is (command, title); a split is (terminal, direction, command)
+        commands = [c[0] if len(c) == 2 else c[2] for c in five_board.ghostty.calls]
+        check("--lines reaches every pane", len(commands) == 5
+              and all(c.endswith("--lines 5") for c in commands), True)
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                main(["--lines", "-1", "--self-test"])
+                refused = False
+            except SystemExit as e:
+                refused = e.code == 2
+        check("a negative --lines is refused", refused, True)
+
+        # The link server, end to end, then each refusal.
+        server = board.server
+        check("the board runs a link server, on this Mac alone",
+              server is not None and server.httpd.server_address[0] == "127.0.0.1", True)
+        check("its token reaches the panes in the script, never on a command line",
+              all(server.token in s for s in board.ghostty.scripts)
+              and not any(server.token in a for c in board.ghostty.calls for a in c), True)
+        five_board.server.close()
+        with urllib.request.urlopen(f"{server.base}/a0/toolu_a", timeout=5) as got:
+            served = got.read().decode()
+        check("a click serves the whole result, with its call",
+              served, "Bash: Read status\n\nerror: fatal: no repo\nmore\n")
+        host = f"127.0.0.1:{server.port}"
+        for what, path, want_host, want in (
+                ("a wrong token", "/" + ("B" if server.token[0] == "A" else "A")
+                 + server.token[1:] + "/a0/toolu_a", host, 404),
+                ("a call the transcript doesn't have", f"/{server.token}/a0/toolu_z", host, 404),
+                ("an agent that isn't in the run", f"/{server.token}/a7/toolu_a", host, 404),
+                ("a path out of the run", f"/{server.token}/..%2F..%2Fx/toolu_a", host, 404),
+                ("a request to another name for this address",
+                 f"/{server.token}/a0/toolu_a", "rebound.example:80", 403)):
+            check(f"{what} is refused", server.answer(path, want_host)[0], want)
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
+        conn.request("GET", f"/{server.token}/a0/toolu_a", headers={"Host": "rebound.example"})
+        check("and refused over the wire too", conn.getresponse().status, 403)
+        conn.close()
+
+        # A pane's links.
+        link = pane_links(server.base, "a0")
+        check("no base, no links", pane_links("", "a0"), None)
+        check("a link names the agent and the call", link("toolu_a"), f"{server.base}/a0/toolu_a")
+        check("an id that isn't safe gets no link", link("../x"), None)
+        linked = result_lines("one\ntwo\nthree", "12:00:00", False, 60, 1, link("toolu_a"))[0]
+        check("the count is the link", f"\033]8;;{server.base}/a0/toolu_a\033\\[+2 lines]"
+              "\033]8;;\033\\" in linked, True)
+        visible = re.sub(r"\033\]8;;[^\033]*\033\\|\033\[[0-9;]*m", "", linked)
+        check("and the link takes no columns", len(visible) <= 60
+              and visible.endswith("one  [+2 lines]"), True)
+        saved_links = os.environ.get(LINKS)
+        os.environ[LINKS] = server.base
+        try:
+            shown = io.StringIO()
+            tail(run / "agent-a0.jsonl", journal, "review:0", phase="Review", once=True,
+                 out=shown, most=1)
+            check("a pane links a cut result from its environment",
+                  f"\033]8;;{server.base}/a0/toolu_a\033\\" in shown.getvalue(), True)
+        finally:
+            if saved_links is None:
+                os.environ.pop(LINKS, None)
+            else:
+                os.environ[LINKS] = saved_links
+        server.close()
+
+        # Ghostty's scripts, with and without an environment.
+        plain = Ghostty(True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            plain._run(SPLIT, "t", "right", "cmd")
+        check("no links, no environment in the script",
+              "environment variables" not in plain.scripts[0] and "%ENV%" not in plain.scripts[0],
+              True)
+        try:
+            Ghostty(True, {LINKS: 'http://x/"; do shell script "id'})
+            quoted = False
+        except ValueError:
+            quoted = True
+        check("a value that would need quoting in AppleScript is refused", quoted, True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            bare = watch(run, cols=2, dry_run=True, once=True, links=False)
+        check("--no-links runs no server", bare.server, None)
+        with open(journal, "a") as out:
+            out.write(json.dumps({"type": "result", "agentId": "a0",
+                                  "result": {"findings": [{}]}}) + "\n")
+        shown = io.StringIO()
+        tail(run / "agent-a0.jsonl", journal, "review:0", phase="Review", once=True, out=shown)
+        text = shown.getvalue()
+        check("done once its result is in", "✔ done" in text and "returned 1 findings" in text,
+              True)
+        check("and the bar counts its tool call", "review:0 · Review · ✔ done, returned 1 "
+              "findings · 1 tool calls" in text, True)
+        board.step()
+        check("the board counts the tool call", board.seen["a0"]["tools"], 1)
+        check("and sees the result", "a0" in board.journal.results, True)
+
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+
+        saved = {k: os.environ.get(k) for k in ("COLUMNS", "LINES")}
+        try:
+            os.environ.update(COLUMNS="80", LINES="20")
+            pane = Pane("review:9", "Verify", out=Tty())
+            pane.fit()
+            check("the text starts under the bar, not at the pane's foot",
+                  pane.out.getvalue().startswith("\033[2;20r\033[2;1H"), True)
+            pane.show(["a line"] * 30)
+            os.environ["LINES"] = "25"
+            pane.fit()
+            check("after a resize the cursor goes back after the text",
+                  "\033[2;25r\033[25;1H" in pane.out.getvalue(), True)
+            when = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=125)
+            (run / "agent-a9.jsonl").write_text(json.dumps(
+                {"type": "user", "timestamp": when.isoformat().replace("+00:00", "Z"),
+                 "message": {"content": "the task"}}) + "\n")
+            shown = Tty()
+            tail(run / "agent-a9.jsonl", journal, "review:9", "Verify", once=True, out=shown)
+            check("the bar's time is the agent's age, from its transcript",
+                  "· 2m0" in shown.getvalue(), True)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+    if fails:
+        print("\n".join(f"FAIL {f}" for f in fails))
+        return 1
+    print("self-test: all checks passed")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="watch-workflow", description=__doc__.split("\n")[0])
+    ap.add_argument("run", nargs="?", help="a run id (wf_...), a prefix of one, or its directory")
+    ap.add_argument("--list", action="store_true", help="list the recent runs")
+    ap.add_argument("--cols", type=int, help="columns per phase's tab "
+                                             f"(default: one per {COLUMN} characters of width)")
+    ap.add_argument("--lines", type=int, default=RESULT_LINES, metavar="N",
+                    help=f"lines of each tool result a pane shows (default {RESULT_LINES}; "
+                         "0 for all of them)")
+    ap.add_argument("--no-links", action="store_true",
+                    help="no link server, so the [+N lines] counts aren't links")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print each osascript call instead of making it; it still follows the run")
+    ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--tail", help=argparse.SUPPRESS)
+    ap.add_argument("--journal", help=argparse.SUPPRESS)
+    ap.add_argument("--label", default="agent", help=argparse.SUPPRESS)
+    ap.add_argument("--phase", default="agents", help=argparse.SUPPRESS)
+    ap.add_argument("--once", action="store_true", help=argparse.SUPPRESS)
+    args = ap.parse_args(argv)
+    if args.lines < 0:
+        ap.error("--lines is a count of lines, 0 for all of them")
+    if args.self_test:
+        return self_test()
+    if args.tail:
+        return tail(args.tail, args.journal, args.label, args.phase, once=args.once,
+                    most=args.lines)
+    if args.list:
+        list_runs()
+        return 0
+    if shutil.which("osascript") is None and not args.dry_run:
+        raise SystemExit("osascript isn't on PATH: this needs macOS")
+    watch(find_run(args.run), args.cols and max(1, args.cols), dry_run=args.dry_run,
+          most=args.lines, links=not args.no_links)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
